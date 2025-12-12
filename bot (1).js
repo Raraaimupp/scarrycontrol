@@ -369,27 +369,32 @@ async function deleteServerById(id) {
   try { await axios.delete(`${panelUrl}/api/application/servers/${id}`, { headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }); return true; } catch (err) { console.error("❌ Gagal delete:", err.message); return false; }
 }
 
-// ===================== Terjemahan storage & masking (same as userbot part) =====================
+// ===================== Terjemahan storage & masking (diperbarui) =====================
 const DATA_FILE = path.resolve(__dirname, 'translations.json');
-// Struktur baru translationMode:
-// { global: false, chats: { "<chatId>": true, ... } }
-let translationMode = { global: false, chats: {} };
+// Struktur translationMode:
+// { global: false, chats: { "<chatId>": true, ... }, targets: { "<userId>": { forwardTo: <id>, lang: "id" } } }
+let translationMode = { global: false, chats: {}, targets: {} };
+
+// loadTranslationMode (mem-backward kompatibel dengan format lama)
 function loadTranslationMode() {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const raw = fs.readFileSync(DATA_FILE, 'utf8') || '{}';
       const parsed = JSON.parse(raw);
-      if (typeof parsed === 'object' && !parsed.hasOwnProperty('global') && !parsed.hasOwnProperty('chats')) {
-        translationMode.chats = parsed;
-        translationMode.global = false;
+      // backward compatibility
+      if (typeof parsed === 'object' && !parsed.hasOwnProperty('global') && !parsed.hasOwnProperty('chats') && parsed) {
+        translationMode = { global: false, chats: parsed, targets: {} };
       } else {
-        translationMode = Object.assign({ global: false, chats: {} }, parsed);
+        translationMode = Object.assign({ global: false, chats: {}, targets: {} }, parsed || {});
         if (!translationMode.chats) translationMode.chats = {};
+        if (!translationMode.targets) translationMode.targets = {};
       }
-    } else translationMode = { global: false, chats: {} };
+    } else {
+      translationMode = { global: false, chats: {}, targets: {} };
+    }
   } catch (e) {
     console.error('Gagal load translations.json, inisialisasi baru.', e);
-    translationMode = { global: false, chats: {} };
+    translationMode = { global: false, chats: {}, targets: {} };
   }
 }
 function saveTranslationMode() {
@@ -413,14 +418,14 @@ async function sendErrorLog(client, err) {
 
 function maskSensitive(text) {
   const masks = [];
-  let masked = text;
+  let masked = text || '';
   masked = masked.replace(/```[\s\S]*?```/g, m => { const key = `__MASK_CODE_${masks.length}__`; masks.push({ key, val: m }); return key; });
   masked = masked.replace(/`[^`]*`/g, m => { const key = `__MASK_CODE_${masks.length}__`; masks.push({ key, val: m }); return key; });
   masked = masked.replace(/https?:\/\/\S+/g, m => { const key = `__MASK_URL_${masks.length}__`; masks.push({ key, val: m }); return key; });
   masked = masked.replace(/[@#][\w\d_]+/g, m => { const key = `__MASK_TAG_${masks.length}__`; masks.push({ key, val: m }); return key; });
   return { masked, masks };
 }
-function restoreMasks(text, masks) { let out = text; for (const m of masks) out = out.replace(new RegExp(m.key, 'g'), m.val); return out; }
+function restoreMasks(text, masks) { let out = text || ''; for (const m of masks) out = out.replace(new RegExp(m.key, 'g'), m.val); return out; }
 function getChatIdString(event) {
   if (event.chatId) return event.chatId.toString();
   if (event.message && event.message.chatId) return event.message.chatId.toString();
@@ -431,6 +436,133 @@ function isTranslationEnabledForChat(chatId) {
   return !!translationMode.global || !!translationMode.chats[chatId];
 }
 
+// helper: resolve username/@username/id => numeric id string (uses client)
+async function resolveToUserId(client, ident) {
+  if (!ident) return null;
+  ident = ident.toString().trim();
+  if (/^\d+$/.test(ident)) return ident;
+  if (ident.startsWith('@')) ident = ident.slice(1);
+  try {
+    const ent = await client.getEntity(ident);
+    const uid = (ent && (ent.id || ent.userId || (ent.peerId && (ent.peerId.userId || ent.peerId.channelId)))) || null;
+    if (uid) return String(uid);
+  } catch (e) {
+    // fallback try getInputEntity
+    try {
+      const ip = await client.getInputEntity(ident);
+      const maybe = String(ip.userId || ip.channelId || ip.chatId || '');
+      if (maybe) return maybe;
+    } catch (er) {}
+  }
+  return null;
+}
+
+async function addTranslationTarget(client, actorId, rawIdent, lang = 'id') {
+  const resolved = await resolveToUserId(client, rawIdent);
+  if (!resolved) return { ok: false, reason: 'Gagal resolve username/id. Pastikan username benar & user pernah memulai chat dengan userbot.' };
+  translationMode.targets[resolved] = { forwardTo: String(OWNER_ID || actorId), lang: lang || 'id', addedBy: String(actorId), addedAt: new Date().toISOString() };
+  saveTranslationMode();
+  return { ok: true, targetId: resolved };
+}
+
+function removeTranslationTarget(rawIdentOrId) {
+  if (!rawIdentOrId) return { ok: false };
+  const key = String(rawIdentOrId).trim();
+  if (translationMode.targets[key]) {
+    delete translationMode.targets[key];
+    saveTranslationMode();
+    return { ok: true, removed: key };
+  }
+  const k = Object.keys(translationMode.targets).find(k => k === key || k.endsWith(key) || k.includes(key));
+  if (k) {
+    delete translationMode.targets[k];
+    saveTranslationMode();
+    return { ok: true, removed: k };
+  }
+  return { ok: false };
+}
+
+function isTargetTrackedById(userId) {
+  if (!userId) return false;
+  return !!translationMode.targets[String(userId)];
+}
+// ===================== End storage helpers =====================
+        // --- CHECK: apakah pengirim termasuk target terjemahan? (INCOMING only) ---
+        if (!isOutgoing) {
+          const senderIdStr = String(senderId || '');
+          if (senderIdStr && translationMode.targets && translationMode.targets[senderIdStr]) {
+            try {
+              const cfg = translationMode.targets[senderIdStr];
+              if (text && !text.startsWith('/')) {
+                const { masked, masks } = maskSensitive(text);
+                let translated;
+                try {
+                  translated = await translate(masked, { to: cfg.lang || 'id' });
+                  if (typeof translated !== 'string') translated = String(translated);
+                } catch (e) {
+                  console.error('Translate error (Incoming target):', e);
+                  translated = null;
+                }
+                const finalTranslated = translated ? restoreMasks(translated, masks) : '(Terjemahan gagal)';
+                let info = `<b>🔔 Pesan dari target (auto-translate)</b>\n`;
+                info += `<b>From:</b> <code>${senderIdStr}</code>\n`;
+                info += `<b>Chat:</b> <code>${chatId}</code>\n\n`;
+                info += `<b>Original:</b>\n${text}\n\n<b>Terjemahan (${cfg.lang || 'id'}):</b>\n${finalTranslated}`;
+                const forwardTo = cfg.forwardTo || String(OWNER_ID);
+                try { await mtSendMessage(client, forwardTo, info, { parseMode: 'html' }); } catch (e) { console.error('Gagal kirim hasil terjemahan target ke owner:', e); }
+              }
+            } catch (e) { console.error('Error handling tracked target incoming:', e); }
+            // jangan return supaya event handler tetap memproses command lain jika perlu
+          }
+        }
+
+        // --- ADD / DEL translation targets (owner atau akses users) ---
+        if (text.startsWith('/add ')) {
+          const sender = synth.from.id;
+          if (!isAkses(sender) && !isOwner(sender)) {
+            await mtSendMessage(client, synth.chat.id, '❌ Kamu tidak punya izin untuk menambah target terjemahan.');
+            return;
+          }
+          const parts = text.split(/\s+/).slice(1);
+          const ident = parts[0];
+          const lang = parts[1] || 'id';
+          if (!ident) {
+            await mtSendMessage(client, synth.chat.id, '❌ Gunakan: /add @username atau /add <id> (opsional: /add @username en)');
+            return;
+          }
+          const res = await addTranslationTarget(client, sender, ident, lang);
+          if (!res.ok) {
+            await mtSendMessage(client, synth.chat.id, `❌ Gagal tambah target: ${res.reason || 'Unknown'}`);
+            return;
+          }
+          await mtSendMessage(client, synth.chat.id, `✅ Target ditambahkan: <code>${res.targetId}</code>\nSemua pesan dari target ini akan diterjemahkan dan diteruskan ke OWNER (${OWNER_ID}).`, { parseMode: 'html' });
+          return;
+        }
+
+        if (text.startsWith('/del ')) {
+          const sender = synth.from.id;
+          if (!isAkses(sender) && !isOwner(sender)) {
+            await mtSendMessage(client, synth.chat.id, '❌ Kamu tidak punya izin untuk menghapus target terjemahan.');
+            return;
+          }
+          const ident = text.split(/\s+/)[1];
+          if (!ident) {
+            await mtSendMessage(client, synth.chat.id, '❌ Gunakan: /del @username atau /del <id>');
+            return;
+          }
+          let resolved = ident;
+          if (!/^\d+$/.test(ident)) {
+            const tryResolve = await resolveToUserId(client, ident);
+            if (tryResolve) resolved = tryResolve;
+          }
+          const r = removeTranslationTarget(resolved);
+          if (r.ok) {
+            await mtSendMessage(client, synth.chat.id, `✅ Target terhapus: <code>${r.removed}</code>`, { parseMode: 'html' });
+          } else {
+            await mtSendMessage(client, synth.chat.id, '❌ Target tidak ditemukan di daftar.');
+          }
+          return;
+        }
 // ================= START MTProto client and handlers =================
 (async () => {
   if (!API_ID || !API_HASH) {
