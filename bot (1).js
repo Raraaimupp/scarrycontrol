@@ -516,53 +516,6 @@ function isTargetTrackedById(userId) {
           }
         }
 
-        // --- ADD / DEL translation targets (owner atau akses users) ---
-        if (text.startsWith('/add ')) {
-          const sender = synth.from.id;
-          if (!isAkses(sender) && !isOwner(sender)) {
-            await mtSendMessage(client, synth.chat.id, '❌ Kamu tidak punya izin untuk menambah target terjemahan.');
-            return;
-          }
-          const parts = text.split(/\s+/).slice(1);
-          const ident = parts[0];
-          const lang = parts[1] || 'id';
-          if (!ident) {
-            await mtSendMessage(client, synth.chat.id, '❌ Gunakan: /add @username atau /add <id> (opsional: /add @username en)');
-            return;
-          }
-          const res = await addTranslationTarget(client, sender, ident, lang);
-          if (!res.ok) {
-            await mtSendMessage(client, synth.chat.id, `❌ Gagal tambah target: ${res.reason || 'Unknown'}`);
-            return;
-          }
-          await mtSendMessage(client, synth.chat.id, `✅ Target ditambahkan: <code>${res.targetId}</code>\nSemua pesan dari target ini akan diterjemahkan dan diteruskan ke OWNER (${OWNER_ID}).`, { parseMode: 'html' });
-          return;
-        }
-
-        if (text.startsWith('/del ')) {
-          const sender = synth.from.id;
-          if (!isAkses(sender) && !isOwner(sender)) {
-            await mtSendMessage(client, synth.chat.id, '❌ Kamu tidak punya izin untuk menghapus target terjemahan.');
-            return;
-          }
-          const ident = text.split(/\s+/)[1];
-          if (!ident) {
-            await mtSendMessage(client, synth.chat.id, '❌ Gunakan: /del @username atau /del <id>');
-            return;
-          }
-          let resolved = ident;
-          if (!/^\d+$/.test(ident)) {
-            const tryResolve = await resolveToUserId(client, ident);
-            if (tryResolve) resolved = tryResolve;
-          }
-          const r = removeTranslationTarget(resolved);
-          if (r.ok) {
-            await mtSendMessage(client, synth.chat.id, `✅ Target terhapus: <code>${r.removed}</code>`, { parseMode: 'html' });
-          } else {
-            await mtSendMessage(client, synth.chat.id, '❌ Target tidak ditemukan di daftar.');
-          }
-          return;
-        }
 // ================= START MTProto client and handlers =================
 (async () => {
   if (!API_ID || !API_HASH) {
@@ -670,6 +623,78 @@ function isTargetTrackedById(userId) {
           return;
         }
 
+                // --- ADD / DEL translation targets (owner atau akses users) ---
+        if (text.startsWith('/add ')) {
+          const sender = synth.from.id;
+          if (!isAkses(sender) && !isOwner(sender)) {
+            await mtSendMessage(client, synth.chat.id, '❌ Kamu tidak punya izin untuk menambah target terjemahan.');
+            return;
+          }
+
+          const parts = text.trim().split(/\s+/).slice(1);
+          const identRaw = parts[0] || '';
+          const lang = (parts[1] || 'id').toLowerCase();
+
+          const ident = identRaw.trim();
+          if (!ident) {
+            await mtSendMessage(client, synth.chat.id, '❌ Gunakan: /add @username atau /add <id> (opsional: /add @username en)');
+            return;
+          }
+
+          // try resolve but catch errors
+          let res;
+          try {
+            res = await addTranslationTarget(client, sender, ident, lang);
+          } catch (e) {
+            console.error('Error saat addTranslationTarget:', e);
+            res = { ok: false, reason: 'Internal error saat resolve username/id' };
+          }
+
+          if (!res.ok) {
+            await mtSendMessage(client, synth.chat.id, `❌ Gagal tambah target: ${res.reason || 'Unknown'}`);
+            return;
+          }
+
+          await mtSendMessage(client, synth.chat.id,
+            `✅ Target ditambahkan: <code>${res.targetId}</code>\nSemua pesan dari target ini akan diterjemahkan dan diteruskan ke OWNER (${OWNER_ID}).`,
+            { parseMode: 'html' }
+          );
+          return;
+        }
+
+        if (text.startsWith('/del ')) {
+          const sender = synth.from.id;
+          if (!isAkses(sender) && !isOwner(sender)) {
+            await mtSendMessage(client, synth.chat.id, '❌ Kamu tidak punya izin untuk menghapus target terjemahan.');
+            return;
+          }
+
+          const parts = text.trim().split(/\s+/).slice(1);
+          const identRaw = parts[0] || '';
+          if (!identRaw) {
+            await mtSendMessage(client, synth.chat.id, '❌ Gunakan: /del @username atau /del <id>');
+            return;
+          }
+
+          let resolved = identRaw.trim();
+          if (!/^\d+$/.test(resolved)) {
+            try {
+              const tryResolve = await resolveToUserId(client, resolved);
+              if (tryResolve) resolved = tryResolve;
+            } catch (e) {
+              console.error('Error resolving ident saat /del:', e);
+            }
+          }
+
+          const r = removeTranslationTarget(resolved);
+          if (r.ok) {
+            await mtSendMessage(client, synth.chat.id, `✅ Target terhapus: <code>${r.removed}</code>`, { parseMode: 'html' });
+          } else {
+            await mtSendMessage(client, synth.chat.id, '❌ Target tidak ditemukan di daftar.');
+          }
+          return;
+        }
+        
         // handle interactive addPanel steps
         const state = addPanelState[synth.from.id];
         if (state && synth.chat.id === String(synth.from.id)) {
